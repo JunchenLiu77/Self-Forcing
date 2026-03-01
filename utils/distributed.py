@@ -8,6 +8,12 @@ from torch.distributed.fsdp.api import CPUOffload
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 
 
+def _clean_fsdp_keys(state_dict):
+    import re
+    pattern = re.compile(r'_fsdp_wrapped_module\.|_checkpoint_wrapped_module\.|_orig_mod\.')
+    return {pattern.sub('', k): v for k, v in state_dict.items()}
+
+
 def fsdp_state_dict(model):
     fsdp_fullstate_save_policy = FullStateDictConfig(
         offload_to_cpu=True, rank0_only=True
@@ -17,7 +23,7 @@ def fsdp_state_dict(model):
     ):
         checkpoint = model.state_dict()
 
-    return checkpoint
+    return _clean_fsdp_keys(checkpoint)
 
 
 def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False):

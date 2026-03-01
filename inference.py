@@ -24,7 +24,8 @@ parser.add_argument("--config_path", type=str, help="Path to the config file")
 parser.add_argument("--checkpoint_path", type=str, help="Path to the checkpoint folder")
 parser.add_argument("--data_path", type=str, help="Path to the dataset")
 parser.add_argument("--extended_prompt_path", type=str, help="Path to the extended prompt")
-parser.add_argument("--output_folder", type=str, help="Output folder")
+parser.add_argument("--output_folder", type=str, default=None,
+                    help="Output folder. If not set, auto-derived from checkpoint_path as videos/{exp_name}/{iter}/")
 parser.add_argument("--num_output_frames", type=int, default=21,
                     help="Number of overlap frames between sliding windows")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
@@ -33,7 +34,23 @@ parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to generate per prompt")
 parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
+parser.add_argument("--first_n", type=int, default=0,
+                    help="Only process the first N prompts (0 = process all)")
+parser.add_argument("--num_windows", type=int, default=1,
+                    help="Number of sliding windows for longer video generation (each adds ~72 pixel frames)")
 args = parser.parse_args()
+
+if args.output_folder is None and args.checkpoint_path:
+    # Derive output folder from checkpoint path:
+    # e.g. .../outputs/self_forcing_dmd/checkpoint_model_000350/model.pt
+    #   -> exp_name = "self_forcing_dmd", iter = "000350"
+    #   -> output_folder = "videos/self_forcing_dmd/000350"
+    ckpt_dir = os.path.dirname(args.checkpoint_path)          # .../checkpoint_model_000350
+    ckpt_dir_name = os.path.basename(ckpt_dir)                # checkpoint_model_000350
+    exp_name = os.path.basename(os.path.dirname(ckpt_dir))    # self_forcing_dmd
+    iter_str = ckpt_dir_name.rsplit("_", 1)[-1]               # 000350
+    args.output_folder = os.path.join("videos", exp_name, iter_str)
+    print(f"Auto-derived output folder: {args.output_folder}")
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
@@ -67,8 +84,13 @@ else:
     pipeline = CausalDiffusionInferencePipeline(config, device=device)
 
 if args.checkpoint_path:
+    import re
     state_dict = torch.load(args.checkpoint_path, map_location="cpu")
-    pipeline.generator.load_state_dict(state_dict['generator' if not args.use_ema else 'generator_ema'])
+    key = 'generator' if not args.use_ema else 'generator_ema'
+    ckpt = state_dict[key]
+    pattern = re.compile(r'_fsdp_wrapped_module\.|_checkpoint_wrapped_module\.|_orig_mod\.')
+    ckpt = {pattern.sub('', k): v for k, v in ckpt.items()}
+    pipeline.generator.load_state_dict(ckpt)
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
 if low_memory:
@@ -120,37 +142,45 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
     return output
 
 
+num_frame_per_block = getattr(config, 'num_frame_per_block', 1)
+
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
+    if args.first_n > 0 and i >= args.first_n:
+        break
+
     idx = batch_data['idx'].item()
 
-    # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
-    # Unpack the batch data for convenience
     if isinstance(batch_data, dict):
         batch = batch_data
     elif isinstance(batch_data, list):
-        batch = batch_data[0]  # First (and only) item in the batch
-
-    all_video = []
-    num_generated_frames = 0  # Number of generated (latent) frames
+        batch = batch_data[0]
 
     if args.i2v:
-        # For image-to-video, batch contains image and caption
-        prompt = batch['prompts'][0]  # Get caption from batch
+        prompt = batch['prompts'][0]
+    else:
+        prompt = batch['prompts'][0]
+
+    # Build output paths and check if all already exist
+    win_tag = f"w{args.num_windows}"
+    output_paths = {}
+    for seed_idx in range(args.num_samples):
+        if args.save_with_index:
+            fname = f'{idx}_{seed_idx}_{win_tag}.mp4'
+        else:
+            fname = f'{prompt[:100]}_{seed_idx}_{win_tag}.mp4'
+        output_paths[seed_idx] = os.path.join(args.output_folder, fname)
+
+    if idx < num_prompts and all(os.path.exists(p) for p in output_paths.values()):
+        print(f"Skipping idx={idx}, all outputs exist")
+        continue
+
+    # Prepare prompts and initial_latent
+    if args.i2v:
         prompts = [prompt] * args.num_samples
-
-        # Process the image
         image = batch['image'].squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.bfloat16)
-
-        # Encode the input image as the first latent
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
         initial_latent = initial_latent.repeat(args.num_samples, 1, 1, 1, 1)
-
-        sampled_noise = torch.randn(
-            [args.num_samples, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
-        )
     else:
-        # For text-to-video, batch is just the text prompt
-        prompt = batch['prompts'][0]
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
         if extended_prompt is not None:
             prompts = [extended_prompt] * args.num_samples
@@ -158,35 +188,42 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             prompts = [prompt] * args.num_samples
         initial_latent = None
 
+    all_video = []
+    for window_idx in range(args.num_windows):
+        if initial_latent is not None:
+            num_initial = initial_latent.shape[1]
+            noise_frames = ((args.num_output_frames - num_initial) // num_frame_per_block) * num_frame_per_block
+        else:
+            noise_frames = args.num_output_frames
+
         sampled_noise = torch.randn(
-            [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
+            [args.num_samples, noise_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
 
-    # Generate 81 frames
-    video, latents = pipeline.inference(
-        noise=sampled_noise,
-        text_prompts=prompts,
-        return_latents=True,
-        initial_latent=initial_latent,
-        low_memory=low_memory,
-    )
-    current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
-    all_video.append(current_video)
-    num_generated_frames += latents.shape[1]
+        video, latents = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts=prompts,
+            return_latents=True,
+            initial_latent=initial_latent,
+            low_memory=low_memory,
+        )
 
-    # Final output video
+        current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
+        if window_idx > 0:
+            overlap_pixels = (num_frame_per_block - 1) * 4 + 1
+            current_video = current_video[:, overlap_pixels:]
+        all_video.append(current_video)
+
+        if window_idx < args.num_windows - 1:
+            initial_latent = latents[:, -num_frame_per_block:].to(dtype=torch.bfloat16)
+
+        pipeline.vae.model.clear_cache()
+
     video = 255.0 * torch.cat(all_video, dim=1)
 
-    # Clear VAE cache
-    pipeline.vae.model.clear_cache()
-
-    # Save the video if the current prompt is not a dummy prompt
     if idx < num_prompts:
-        model = "regular" if not args.use_ema else "ema"
         for seed_idx in range(args.num_samples):
-            # All processes save their videos
-            if args.save_with_index:
-                output_path = os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}.mp4')
-            else:
-                output_path = os.path.join(args.output_folder, f'{prompt[:100]}-{seed_idx}.mp4')
+            output_path = output_paths[seed_idx]
+            if os.path.exists(output_path):
+                continue
             write_video(output_path, video[seed_idx], fps=16)

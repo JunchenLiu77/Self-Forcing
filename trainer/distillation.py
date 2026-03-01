@@ -1,5 +1,6 @@
 import gc
 import logging
+import shutil
 
 from utils.dataset import ShardingLMDBDataset, cycle
 from utils.dataset import TextDataset
@@ -44,16 +45,53 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
+        # Auto-detect if we can resume from an existing checkpoint in logdir
+        self._resuming = False
+        self._resume_ckpt = None
+        if config.logdir:
+            latest = self._find_latest_checkpoint(config.logdir)
+            if latest is not None:
+                self._resuming = True
+                self._resume_ckpt = latest
+                print(f"Will resume from step {latest[0]}: {latest[1]}")
+
         if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
+            def _get_wandb_var(env_name, config_attr):
+                val = os.environ.get(env_name) or getattr(config, config_attr, None)
+                if val and val == env_name:
+                    return None
+                return val or None
+
+            wandb_host = _get_wandb_var("WANDB_HOST", "wandb_host")
+            wandb_key = _get_wandb_var("WANDB_KEY", "wandb_key")
+            wandb_entity = _get_wandb_var("WANDB_ENTITY", "wandb_entity")
+            wandb_project = _get_wandb_var("WANDB_PROJECT", "wandb_project")
+            if wandb_key:
+                wandb.login(host=wandb_host, key=wandb_key)
+            wandb_dir = config.wandb_save_dir or config.logdir or None
+            if wandb_dir:
+                os.makedirs(wandb_dir, exist_ok=True)
+            wandb_kwargs = dict(
                 config=OmegaConf.to_container(config, resolve=True),
                 name=config.config_name,
                 mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
+                dir=wandb_dir,
             )
+            if wandb_entity:
+                wandb_kwargs["entity"] = wandb_entity
+            if wandb_project:
+                wandb_kwargs["project"] = wandb_project
+            if self._resuming:
+                wandb_id_file = os.path.join(config.logdir, "wandb_id")
+                if os.path.isfile(wandb_id_file):
+                    with open(wandb_id_file) as f:
+                        wandb_kwargs["id"] = f.read().strip()
+                    wandb_kwargs["resume"] = "must"
+                    print(f"Resuming wandb run: {wandb_kwargs['id']}")
+            wandb.init(**wandb_kwargs)
+            os.makedirs(config.logdir, exist_ok=True)
+            with open(os.path.join(config.logdir, "wandb_id"), "w") as f:
+                f.write(wandb.run.id)
 
         self.output_path = config.logdir
 
@@ -153,13 +191,17 @@ class Trainer:
         ema_weight = config.ema_weight
         self.generator_ema = None
         if (ema_weight is not None) and (ema_weight > 0.0):
-            print(f"Setting up EMA with weight {ema_weight}")
+            if self.is_main_process:
+                print(f"Setting up EMA with weight {ema_weight}")
             self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
 
         ##############################################################################################################
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
-        if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
+        if self._resuming:
+            self._load_resume_checkpoint()
+        elif getattr(config, "generator_ckpt", False):
+            if self.is_main_process:
+                print(f"Loading pretrained generator from {config.generator_ckpt}")
             state_dict = torch.load(config.generator_ckpt, map_location="cpu")
             if "generator" in state_dict:
                 state_dict = state_dict["generator"]
@@ -179,8 +221,37 @@ class Trainer:
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
 
+    @staticmethod
+    def _find_latest_checkpoint(logdir):
+        if not os.path.exists(logdir):
+            return None
+        checkpoints = []
+        for d in os.listdir(logdir):
+            if d.startswith("checkpoint_model_"):
+                ckpt_path = os.path.join(logdir, d, "model.pt")
+                if os.path.isfile(ckpt_path):
+                    step = int(d.rsplit("_", 1)[-1])
+                    checkpoints.append((step, ckpt_path))
+        if not checkpoints:
+            return None
+        checkpoints.sort(key=lambda x: x[0], reverse=True)
+        return checkpoints[0]
+
+    def _load_resume_checkpoint(self):
+        step, ckpt_path = self._resume_ckpt
+        if self.is_main_process:
+            print(f"Resuming from checkpoint (step {step}): {ckpt_path}")
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+        self.model.generator.load_state_dict(state_dict["generator"], strict=True)
+        if "critic" in state_dict:
+            self.model.fake_score.load_state_dict(state_dict["critic"], strict=True)
+        if "generator_ema" in state_dict and self.generator_ema is not None:
+            self.generator_ema.load_state_dict(state_dict["generator_ema"])
+        self.step = state_dict.get("step", step)
+        if self.is_main_process:
+            print(f"Resumed at step {self.step}")
+
     def save(self):
-        print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(
             self.model.generator)
         critic_state_dict = fsdp_state_dict(
@@ -188,23 +259,36 @@ class Trainer:
 
         if self.config.ema_start_step < self.step:
             state_dict = {
+                "step": self.step,
                 "generator": generator_state_dict,
                 "critic": critic_state_dict,
                 "generator_ema": self.generator_ema.state_dict(),
             }
         else:
             state_dict = {
+                "step": self.step,
                 "generator": generator_state_dict,
                 "critic": critic_state_dict,
             }
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            ckpt_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(state_dict, os.path.join(ckpt_dir, "model.pt"))
+            print(f"Model saved to {ckpt_dir}/model.pt")
+            self._cleanup_old_checkpoints(keep=4)
+
+    def _cleanup_old_checkpoints(self, keep=4):
+        checkpoints = []
+        for d in os.listdir(self.output_path):
+            if d.startswith("checkpoint_model_"):
+                ckpt_path = os.path.join(self.output_path, d)
+                if os.path.isdir(ckpt_path):
+                    step = int(d.rsplit("_", 1)[-1])
+                    checkpoints.append((step, ckpt_path))
+        checkpoints.sort(key=lambda x: x[0], reverse=True)
+        for _, path in checkpoints[keep:]:
+            shutil.rmtree(path)
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -352,9 +436,9 @@ class Trainer:
 
             # Logging
             if self.is_main_process:
-                wandb_loss_dict = {}
+                loss_dict = {}
                 if TRAIN_GENERATOR:
-                    wandb_loss_dict.update(
+                    loss_dict.update(
                         {
                             "generator_loss": generator_log_dict["generator_loss"].mean().item(),
                             "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
@@ -362,15 +446,24 @@ class Trainer:
                         }
                     )
 
-                wandb_loss_dict.update(
+                loss_dict.update(
                     {
                         "critic_loss": critic_log_dict["critic_loss"].mean().item(),
                         "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
                     }
                 )
 
+                current_time = time.time()
+                if self.previous_time is not None:
+                    loss_dict["iter_time"] = current_time - self.previous_time
+                self.previous_time = current_time
+
+                if self.step % self.config.log_iters == 0:
+                    metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in loss_dict.items())
+                    print(f"[step {self.step}] {metrics_str}")
+
                 if not self.disable_wandb:
-                    wandb.log(wandb_loss_dict, step=self.step)
+                    wandb.log(loss_dict, step=self.step)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:

@@ -1,5 +1,21 @@
 __pycache__
 *.egg-info
 
+# data
 wan_models
 checkpoints
+outputs
+prompts
+
+# scripts
+scripts/run
+scripts/run*
+
+# uv
+.python-version
+
+# wandb
+wandb
+
+# videos
+videos
