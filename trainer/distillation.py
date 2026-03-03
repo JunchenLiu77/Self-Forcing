@@ -11,7 +11,7 @@ from utils.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import CausVid, DMD, SiD
+from model import CausVid, DMD, SiD, TTT_E2E
 import torch
 import wandb
 import time
@@ -96,7 +96,10 @@ class Trainer:
         self.output_path = config.logdir
 
         # Step 2: Initialize the model and optimizer
-        if config.distribution_loss == "causvid":
+        ttt_mode = getattr(config, "ttt_mode", None)
+        if ttt_mode == "e2e":
+            self.model = TTT_E2E(config, device=self.device)
+        elif config.distribution_loss == "causvid":
             self.model = CausVid(config, device=self.device)
         elif config.distribution_loss == "dmd":
             self.model = DMD(config, device=self.device)
@@ -104,6 +107,12 @@ class Trainer:
             self.model = SiD(config, device=self.device)
         else:
             raise ValueError("Invalid distribution matching loss")
+
+        # Enable TTT prime adapters before FSDP wrapping
+        if getattr(config, "ttt_enabled", False):
+            ttt_suffix_len = getattr(config, "ttt_suffix_len", 3)
+            ttt_prime_ffn_dim = getattr(config, "ttt_prime_ffn_dim", 1536)
+            self.model.generator.model.enable_ttt(ttt_suffix_len, ttt_prime_ffn_dim)
 
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
@@ -207,8 +216,9 @@ class Trainer:
                 state_dict = state_dict["generator"]
             elif "model" in state_dict:
                 state_dict = state_dict["model"]
+            strict_load = not getattr(config, "ttt_enabled", False)
             self.model.generator.load_state_dict(
-                state_dict, strict=True
+                state_dict, strict=strict_load
             )
 
         ##############################################################################################################
@@ -445,6 +455,8 @@ class Trainer:
                             "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                         }
                     )
+                    if "ttt_inner_loss" in generator_log_dict:
+                        loss_dict["ttt_inner_loss"] = generator_log_dict["ttt_inner_loss"].mean().item()
 
                 loss_dict.update(
                     {

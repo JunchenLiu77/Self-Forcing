@@ -13,6 +13,7 @@ from torch.utils.data.distributed import DistributedSampler
 from pipeline import (
     CausalDiffusionInferencePipeline,
     CausalInferencePipeline,
+    TTTInferencePipeline,
 )
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
@@ -76,11 +77,12 @@ default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
 
 # Initialize pipeline
-if hasattr(config, 'denoising_step_list'):
-    # Few-step inference
+ttt_enabled = getattr(config, 'ttt_enabled', False)
+if ttt_enabled:
+    pipeline = TTTInferencePipeline(config, device=device)
+elif hasattr(config, 'denoising_step_list'):
     pipeline = CausalInferencePipeline(config, device=device)
 else:
-    # Multi-step diffusion inference
     pipeline = CausalDiffusionInferencePipeline(config, device=device)
 
 if args.checkpoint_path:
@@ -90,7 +92,13 @@ if args.checkpoint_path:
     ckpt = state_dict[key]
     pattern = re.compile(r'_fsdp_wrapped_module\.|_checkpoint_wrapped_module\.|_orig_mod\.')
     ckpt = {pattern.sub('', k): v for k, v in ckpt.items()}
-    pipeline.generator.load_state_dict(ckpt)
+    pipeline.generator.load_state_dict(ckpt, strict=False)
+
+# Enable TTT prime adapters after loading weights
+if ttt_enabled:
+    ttt_suffix_len = getattr(config, 'ttt_suffix_len', 3)
+    ttt_prime_ffn_dim = getattr(config, 'ttt_prime_ffn_dim', 1536)
+    pipeline.generator.model.enable_ttt(ttt_suffix_len, ttt_prime_ffn_dim)
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
 if low_memory:

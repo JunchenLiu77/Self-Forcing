@@ -55,6 +55,39 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     return torch.stack(output).type_as(x)
 
 
+class PrimeFFN(nn.Module):
+    """Lightweight adapter MLP for TTT inner-loop updates.
+
+    Added to the last `suffix_len` transformer blocks. Output-layer is
+    zero-initialised so the pretrained model is unchanged at init.
+    """
+
+    def __init__(self, dim, prime_ffn_dim, eps=1e-6):
+        super().__init__()
+        self.norm = WanLayerNorm(dim, eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, prime_ffn_dim),
+            nn.GELU(approximate='tanh'),
+            nn.Linear(prime_ffn_dim, dim))
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim ** 0.5)
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+
+    def forward(self, x, e_base):
+        """
+        Args:
+            x: [B, L, C]
+            e_base: [B, F, 1, C] — per-frame timestep embedding (before modulation)
+        """
+        num_frames = e_base.shape[1]
+        frame_seqlen = x.shape[1] // num_frames
+        e = (self.modulation.unsqueeze(1) + e_base).chunk(2, dim=2)  # 2 x [B, F, 1, C]
+        y = self.ffn(
+            (self.norm(x).unflatten(1, (num_frames, frame_seqlen))
+             * (1 + e[1]) + e[0]).flatten(1, 2))
+        return y
+
+
 class CausalWanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -92,7 +125,8 @@ class CausalWanSelfAttention(nn.Module):
         block_mask,
         kv_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        update_cache=True
     ):
         r"""
         Args:
@@ -101,6 +135,7 @@ class CausalWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             block_mask (BlockMask)
+            update_cache (bool): When False, read from KV cache without writing.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
@@ -200,39 +235,51 @@ class CausalWanSelfAttention(nn.Module):
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
-            # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                # Clone the source slice to avoid overlapping memory error
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                # Insert the new keys/values at the end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+
+            if not update_cache:
+                # Read-only mode: attend to cached context + current K/V
+                # without modifying the cache. Used by TTT loss forward pass.
+                prev_local_end = kv_cache["local_end_index"].item()
+                prev_global_end = kv_cache["global_end_index"].item()
+                # Exclude tokens at/after current_start that were written by a
+                # previous forward pass (e.g. the denoising loop)
+                if current_start < prev_global_end:
+                    ctx_local_end = prev_local_end - (prev_global_end - current_start)
+                else:
+                    ctx_local_end = prev_local_end
+                ctx_local_end = max(ctx_local_end, 0)
+                ctx_start = max(0, ctx_local_end + num_new_tokens - self.max_attention_size)
+                full_k = torch.cat([kv_cache["k"][:, ctx_start:ctx_local_end], roped_key], dim=1)
+                full_v = torch.cat([kv_cache["v"][:, ctx_start:ctx_local_end], v], dim=1)
+                x = attention(roped_query, full_k, full_v)
             else:
-                # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
-            x = attention(
-                roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            )
-            kv_cache["global_end_index"].fill_(current_end)
-            kv_cache["local_end_index"].fill_(local_end_index)
+                if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+                        num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+                    num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+                    num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+                    kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    local_end_index = kv_cache["local_end_index"].item() + current_end - \
+                        kv_cache["global_end_index"].item() - num_evicted_tokens
+                    local_start_index = local_end_index - num_new_tokens
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
+                else:
+                    local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                    local_start_index = local_end_index - num_new_tokens
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
+                x = attention(
+                    roped_query,
+                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                )
+                kv_cache["global_end_index"].fill_(current_end)
+                kv_cache["local_end_index"].fill_(local_end_index)
 
         # output
         x = x.flatten(2)
@@ -251,7 +298,8 @@ class CausalWanAttentionBlock(nn.Module):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 prime_ffn_dim=0):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -280,6 +328,9 @@ class CausalWanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+        # TTT prime adapter (only on suffix blocks)
+        self.prime_ffn = PrimeFFN(dim, prime_ffn_dim, eps) if prime_ffn_dim > 0 else None
+
     def forward(
         self,
         x,
@@ -293,7 +344,8 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        update_cache=True
     ):
         r"""
         Args:
@@ -302,23 +354,21 @@ class CausalWanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            update_cache (bool): When False, read from KV cache without writing.
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
-        # assert e.dtype == torch.float32
-        # with amp.autocast(dtype=torch.float32):
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        # assert e[0].dtype == torch.float32
 
         # self-attention
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
+            freqs, block_mask, kv_cache, current_start, cache_start,
+            update_cache=update_cache)
 
-        # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
-        # cross-attention & ffn function
+        # cross-attention & ffn
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
             x = x + self.cross_attn(self.norm3(x), context,
                                     context_lens, crossattn_cache=crossattn_cache)
@@ -326,12 +376,17 @@ class CausalWanAttentionBlock(nn.Module):
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
             )
-            # with amp.autocast(dtype=torch.float32):
             x = x + (y.unflatten(dim=1, sizes=(num_frames,
                      frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
+
+        # TTT prime adapter (parallel to main FFN, on residual stream)
+        if self.prime_ffn is not None:
+            e_base = e[3]  # reuse the FFN shift embedding as base signal
+            x = x + self.prime_ffn(x, e_base)
+
         return x
 
 
@@ -467,6 +522,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
+        self.ttt_suffix_len = 0
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                     local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
@@ -720,7 +776,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        update_cache: bool = True
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -815,7 +872,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     {
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "update_cache": update_cache
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -829,7 +887,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "update_cache": update_cache
                     }
                 )
                 x = block(x, **kwargs)
@@ -1006,6 +1065,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if kwargs.get('kv_cache', None) is not None:
             return self._forward_inference(*args, **kwargs)
         else:
+            kwargs.pop('update_cache', None)
             return self._forward_train(*args, **kwargs)
 
     def unpatchify(self, x, grid_sizes):
@@ -1056,3 +1116,72 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+    # ------------------------------------------------------------------
+    # TTT (Test-Time Training) support
+    # ------------------------------------------------------------------
+    def enable_ttt(self, suffix_len: int, prime_ffn_dim: int):
+        """Add PrimeFFN adapters to the last *suffix_len* transformer blocks.
+
+        Call this **after** loading pretrained weights so the base model is
+        unmodified and the prime adapters start zero-initialised.
+        """
+        self.ttt_suffix_len = suffix_len
+        cross_attn_type = 't2v_cross_attn' if self.model_type == 't2v' else 'i2v_cross_attn'
+        for idx in range(self.num_layers - suffix_len, self.num_layers):
+            old_block = self.blocks[idx]
+            new_block = CausalWanAttentionBlock(
+                cross_attn_type, self.dim, self.ffn_dim, self.num_heads,
+                self.local_attn_size, old_block.self_attn.sink_size,
+                self.qk_norm, self.cross_attn_norm, self.eps,
+                prime_ffn_dim=prime_ffn_dim)
+            # Copy pretrained weights from old block (everything except prime_ffn)
+            new_block.load_state_dict(old_block.state_dict(), strict=False)
+            self.blocks[idx] = new_block
+
+        num_prime_params = sum(p.numel() for p in self.get_prime_parameters())
+        num_total_params = sum(p.numel() for p in self.parameters())
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f"[TTT] Enabled PrimeFFN on {suffix_len}/{self.num_layers} blocks "
+                  f"(prime_ffn_dim={prime_ffn_dim})")
+            print(f"[TTT] Prime params: {num_prime_params:,} "
+                  f"({100 * num_prime_params / num_total_params:.2f}% of "
+                  f"{num_total_params:,} total)")
+
+    def get_prime_parameters(self):
+        """Return an iterator over all PrimeFFN parameters (for TTT inner loop)."""
+        for block in self.blocks:
+            if block.prime_ffn is not None:
+                yield from block.prime_ffn.parameters()
+
+    def get_prime_parameter_list(self):
+        """Return a list of all PrimeFFN parameters."""
+        return list(self.get_prime_parameters())
+
+    def get_prime_named_parameters(self):
+        """Return dict {fully_qualified_name: param} for all PrimeFFN params.
+
+        Names are relative to this CausalWanModel so they work with
+        ``torch.func.functional_call(model, overrides, ...)``.
+        """
+        result = {}
+        for idx, block in enumerate(self.blocks):
+            if block.prime_ffn is not None:
+                prefix = f"blocks.{idx}.prime_ffn."
+                for name, p in block.prime_ffn.named_parameters():
+                    result[prefix + name] = p
+        return result
+
+    def reset_prime_parameters(self):
+        """Re-initialise PrimeFFN adapters so each video starts from a neutral state.
+
+        Only the output layer (ffn[-1]) is zeroed so the adapter produces
+        zero output at init.  The first layer, norm, and modulation keep
+        their trained/random values so gradients can flow through them
+        from the very first TTT step.
+        """
+        for block in self.blocks:
+            if block.prime_ffn is not None:
+                nn.init.zeros_(block.prime_ffn.ffn[-1].weight)
+                nn.init.zeros_(block.prime_ffn.ffn[-1].bias)
+
