@@ -38,6 +38,92 @@ class SelfForcingTrainingPipeline:
         self.last_step_only = last_step_only
         self.kv_cache_size = num_max_frames * self.frame_seq_length
 
+        # TTT-E2E: per-block inner-loop updates during training.
+        # FSDP constraint: TTT can only run for blocks outside the
+        # 21-frame gradient window (a second grad-enabled FSDP forward
+        # after the denoising forward corrupts saved-tensor storage).
+        self.ttt_enabled = kwargs.pop("ttt_enabled", False)
+        self.ttt_inner_lr = kwargs.pop("ttt_inner_lr", 1e-3)
+        self.ttt_inner_clip = kwargs.pop("ttt_inner_clip", 1.0)
+        self.ttt_inner_b1 = kwargs.pop("ttt_inner_b1", 0.9)
+        self.ttt_inner_b2 = kwargs.pop("ttt_inner_b2", 0.999)
+        self._last_ttt_loss = torch.tensor(0.0)
+        self._naive_optimizer = None
+
+    # ------------------------------------------------------------------
+    # TTT helpers
+    # ------------------------------------------------------------------
+    def _unwrap_model(self):
+        model = self.generator.model
+        if hasattr(model, "_fsdp_wrapped_module"):
+            model = model._fsdp_wrapped_module
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        return model
+
+    def _get_prime_params(self):
+        return self._unwrap_model().get_prime_parameter_list()
+
+    def _reset_prime_and_optimizer(self):
+        """Reset PrimeFFN output layers to zero and create a fresh optimizer."""
+        self._unwrap_model().reset_prime_parameters()
+        self._naive_optimizer = None
+
+    @torch.enable_grad()
+    def _ttt_step(self, denoised_pred, conditional_dict, current_start_frame):
+        """One TTT inner-loop step with in-place AdamW on prime params.
+
+        All inputs are detached so the forward builds a self-contained
+        graph that doesn't interfere with the outer DMD autograd graph.
+        After the optimizer step, all generator .grad fields are cleared.
+        """
+        prime_params = self._get_prime_params()
+        if len(prime_params) == 0:
+            return
+        if self._naive_optimizer is None:
+            self._naive_optimizer = torch.optim.AdamW(
+                prime_params,
+                lr=self.ttt_inner_lr,
+                betas=(self.ttt_inner_b1, self.ttt_inner_b2),
+                weight_decay=0.0,
+            )
+        batch_size, num_frames = denoised_pred.shape[:2]
+        device = denoised_pred.device
+
+        pseudo_gt = denoised_pred.detach()
+        step_indices = torch.randint(
+            0, len(self.denoising_step_list),
+            [batch_size, num_frames], device=device)
+        ttt_timestep = self.denoising_step_list.to(device)[step_indices]
+        ttt_noise = torch.randn_like(pseudo_gt)
+        noisy_input = self.scheduler.add_noise(
+            pseudo_gt.flatten(0, 1),
+            ttt_noise.flatten(0, 1),
+            ttt_timestep.flatten(0, 1),
+        ).unflatten(0, (batch_size, num_frames))
+
+        flow_pred, _ = self.generator(
+            noisy_image_or_video=noisy_input.detach(),
+            conditional_dict={k: v.detach() if torch.is_tensor(v) else v
+                              for k, v in conditional_dict.items()},
+            timestep=ttt_timestep,
+            kv_cache=self.kv_cache1,
+            crossattn_cache=self.crossattn_cache,
+            current_start=current_start_frame * self.frame_seq_length,
+            update_cache=False,
+        )
+
+        target = ttt_noise - pseudo_gt
+        loss = torch.mean((flow_pred.float() - target.float()) ** 2)
+        self._last_ttt_loss = loss.detach()
+
+        self._naive_optimizer.zero_grad()
+        loss.backward()
+        if self.ttt_inner_clip > 0:
+            torch.nn.utils.clip_grad_norm_(prime_params, self.ttt_inner_clip)
+        self._naive_optimizer.step()
+        self.generator.zero_grad(set_to_none=True)
+
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -64,6 +150,10 @@ class SelfForcingTrainingPipeline:
             return_sim_step: bool = False,
             **conditional_dict
     ) -> torch.Tensor:
+        # TTT: reset prime adapters + optimizer for each trajectory
+        if self.ttt_enabled:
+            self._reset_prime_and_optimizer()
+
         batch_size, num_frames, num_channels, height, width = noise.shape
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
@@ -152,6 +242,7 @@ class SelfForcingTrainingPipeline:
                     device=noise.device,
                     dtype=torch.int64) * current_timestep
 
+                # TODO: we can update the following generator call to use update_cache=False to avoid updating the cache
                 if not exit_flag:
                     with torch.no_grad():
                         _, denoised_pred = self.generator(
@@ -195,6 +286,12 @@ class SelfForcingTrainingPipeline:
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+
+            # Step 3.2b (TTT): adapt prime params for blocks outside
+            # the gradient window (FSDP constraint prevents TTT inside)
+            if self.ttt_enabled and current_start_frame < start_gradient_frame_index:
+                self._ttt_step(
+                    denoised_pred, conditional_dict, current_start_frame)
 
             # Step 3.3: rerun with timestep zero to update the cache
             context_timestep = torch.ones_like(timestep) * self.context_noise

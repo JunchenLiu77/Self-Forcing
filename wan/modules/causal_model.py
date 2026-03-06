@@ -1158,20 +1158,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         """Return a list of all PrimeFFN parameters."""
         return list(self.get_prime_parameters())
 
-    def get_prime_named_parameters(self):
-        """Return dict {fully_qualified_name: param} for all PrimeFFN params.
-
-        Names are relative to this CausalWanModel so they work with
-        ``torch.func.functional_call(model, overrides, ...)``.
-        """
-        result = {}
-        for idx, block in enumerate(self.blocks):
-            if block.prime_ffn is not None:
-                prefix = f"blocks.{idx}.prime_ffn."
-                for name, p in block.prime_ffn.named_parameters():
-                    result[prefix + name] = p
-        return result
-
     def reset_prime_parameters(self):
         """Re-initialise PrimeFFN adapters so each video starts from a neutral state.
 

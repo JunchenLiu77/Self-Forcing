@@ -13,7 +13,6 @@ from torch.utils.data.distributed import DistributedSampler
 from pipeline import (
     CausalDiffusionInferencePipeline,
     CausalInferencePipeline,
-    TTTInferencePipeline,
 )
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
@@ -76,11 +75,9 @@ config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
 
-# Initialize pipeline
+# Initialize pipeline (TTT is handled internally when ttt_enabled=True)
 ttt_enabled = getattr(config, 'ttt_enabled', False)
-if ttt_enabled:
-    pipeline = TTTInferencePipeline(config, device=device)
-elif hasattr(config, 'denoising_step_list'):
+if hasattr(config, 'denoising_step_list'):
     pipeline = CausalInferencePipeline(config, device=device)
 else:
     pipeline = CausalDiffusionInferencePipeline(config, device=device)

@@ -130,7 +130,8 @@ class SelfForcingModel(BaseModel):
 
         # During training, the number of generated frames should be uniformly sampled from
         # [21, self.num_training_frames], but still being a multiple of self.num_frame_per_block
-        min_num_frames = 20 if self.args.independent_first_frame else 21
+        base_min = 20 if self.args.independent_first_frame else 21
+        min_num_frames = getattr(self, 'min_training_frames', base_min)
         max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
         assert max_num_frames % self.num_frame_per_block == 0
         assert min_num_frames % self.num_frame_per_block == 0

@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--logdir", type=str, default="", help="Path to the directory to save logs")
     parser.add_argument("--wandb-save-dir", type=str, default="", help="Path to the directory to save wandb logs")
     parser.add_argument("--disable-wandb", action="store_true")
+    parser.add_argument("--config_name", type=str, default="", help="Override wandb run name (defaults to config filename)")
 
     args = parser.parse_args()
 
@@ -23,8 +24,7 @@ def main():
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
 
-    # get the filename of config_path
-    config_name = os.path.basename(args.config_path).split(".")[0]
+    config_name = args.config_name or os.path.basename(args.config_path).split(".")[0]
     config.config_name = config_name
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir

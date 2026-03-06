@@ -1,5 +1,7 @@
-# TTT-E2E: meta-learned test-time training for Self-Forcing
-# The outer loop back-propagates through the inner-loop SGD steps.
+# TTT-E2E: test-time training for Self-Forcing video generation.
+# Each iteration prepends min_ttt_blocks..max_ttt_blocks warmup blocks
+# (with TTT inner-loop updates) before the 21-frame gradient window.
+# KV cache is shared between warmup and gradient-window blocks.
 
 # ---- TTT config ----
 ttt_enabled: true
@@ -10,8 +12,8 @@ ttt_inner_lr: 1.0e-03
 ttt_inner_clip: 1.0
 ttt_inner_b1: 0.9
 ttt_inner_b2: 0.999
-ttt_min_timestep: 20
-ttt_max_timestep: 980
+min_ttt_blocks: 1
+max_ttt_blocks: 3
 
 # ---- Base Self-Forcing config ----
 generator_ckpt: checkpoints/ode_init.pt
