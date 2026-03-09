@@ -1,15 +1,14 @@
-# TTT-naive: standard Self-Forcing training + test-time training at inference
-# Inherits from self_forcing_dmd.yaml; only adds TTT-specific config.
+# TTT-naive: inference-only TTT using a standard Self-Forcing checkpoint.
+# PrimeFFN adapters are added at inference and adapted per-block via
+# functional SGD (same inner loop as TTT-E2E training).
 
 # ---- TTT config ----
 ttt_enabled: true
 ttt_mode: naive
-ttt_suffix_len: 10
-ttt_prime_ffn_dim: 1536
-ttt_inner_lr: 1.0e-03
+ttt_suffix_len: 5
+ttt_prime_ffn_dim: 768
+ttt_inner_lr: 1.0               # aligned with LLM TTT inner_lr=1.0
 ttt_inner_clip: 1.0
-ttt_inner_b1: 0.9
-ttt_inner_b2: 0.999
 
 # ---- Base Self-Forcing config (copy from self_forcing_dmd.yaml) ----
 generator_ckpt: checkpoints/ode_init.pt

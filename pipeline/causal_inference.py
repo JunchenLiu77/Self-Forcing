@@ -1,7 +1,12 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.meta_learning import (
+    clone_prime_params,
+    build_fast_weights_dict,
+    functional_inner_step,
+)
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 
@@ -44,13 +49,10 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
-        # TTT-naive: per-block test-time training at inference
+        # TTT meta-learning config
         self.ttt_enabled = getattr(args, "ttt_enabled", False)
         self.ttt_inner_lr = getattr(args, "ttt_inner_lr", 1e-3)
         self.ttt_inner_clip = getattr(args, "ttt_inner_clip", 1.0)
-        self.ttt_inner_b1 = getattr(args, "ttt_inner_b1", 0.9)
-        self.ttt_inner_b2 = getattr(args, "ttt_inner_b2", 0.999)
-        self._inner_optimizer = None
 
     # ------------------------------------------------------------------
     # TTT helpers
@@ -63,32 +65,18 @@ class CausalInferencePipeline(torch.nn.Module):
             model = model._orig_mod
         return model
 
-    def _get_prime_params(self):
-        return self._unwrap_model().get_prime_parameter_list()
-
-    def _reset_prime_and_optimizer(self):
-        """Zero-reinitialise prime adapters and create a fresh AdamW optimizer."""
-        self._unwrap_model().reset_prime_parameters()
-        prime_params = self._get_prime_params()
-        if len(prime_params) > 0:
-            self._inner_optimizer = torch.optim.AdamW(
-                prime_params,
-                lr=self.ttt_inner_lr,
-                betas=(self.ttt_inner_b1, self.ttt_inner_b2),
-                weight_decay=0.0,
-            )
-        else:
-            self._inner_optimizer = None
-
     @torch.enable_grad()
-    def _ttt_step(self, denoised_pred, conditional_dict, current_start):
-        """One TTT inner-loop step: diffusion loss + AdamW on prime params."""
-        if self._inner_optimizer is None:
-            return
-        batch_size, num_frames = denoised_pred.shape[:2]
-        device = denoised_pred.device
+    def _compute_inner_loss(
+        self,
+        pseudo_gt: torch.Tensor,
+        fast_weights: Dict[int, Dict[str, torch.Tensor]],
+        conditional_dict: dict,
+        current_start_frame: int,
+    ) -> torch.Tensor:
+        """Self-supervised denoising loss (mirrors training pipeline)."""
+        batch_size, num_frames = pseudo_gt.shape[:2]
+        device = pseudo_gt.device
 
-        pseudo_gt = denoised_pred.detach()
         step_indices = torch.randint(
             0, len(self.denoising_step_list),
             [batch_size, num_frames], device=device)
@@ -106,20 +94,17 @@ class CausalInferencePipeline(torch.nn.Module):
             timestep=ttt_timestep,
             kv_cache=self.kv_cache1,
             crossattn_cache=self.crossattn_cache,
-            current_start=current_start * self.frame_seq_length,
+            current_start=current_start_frame * self.frame_seq_length,
             update_cache=False,
+            fast_weights=fast_weights,
         )
 
         target = ttt_noise - pseudo_gt
-        loss = torch.mean((flow_pred.float() - target.float()) ** 2)
+        return torch.mean((flow_pred.float() - target.float()) ** 2)
 
-        self._inner_optimizer.zero_grad()
-        loss.backward()
-        if self.ttt_inner_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self._get_prime_params(), self.ttt_inner_clip)
-        self._inner_optimizer.step()
-
+    # ------------------------------------------------------------------
+    # Main inference
+    # ------------------------------------------------------------------
     def inference(
         self,
         noise: torch.Tensor,
@@ -145,14 +130,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 (batch_size, num_output_frames, num_channels, height, width).
                 It is normalized to be in the range [0, 1].
         """
-        # TTT: reset prime adapters + optimizer for each video
-        if self.ttt_enabled:
-            self._reset_prime_and_optimizer()
-
         batch_size, num_frames, num_channels, height, width = noise.shape
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
-            # If the first frame is independent and the first frame is provided, then the number of frames in the
-            # noise should still be a multiple of num_frame_per_block
             assert num_frames % self.num_frame_per_block == 0
             num_blocks = num_frames // self.num_frame_per_block
         else:
@@ -253,6 +232,11 @@ class CausalInferencePipeline(torch.nn.Module):
             torch.cuda.synchronize()
             diffusion_start.record()
 
+        # --- TTT: clone fast weights (graph-connected to originals) ---
+        fast_params = None
+        if self.ttt_enabled:
+            fast_params = clone_prime_params(self._unwrap_model())
+
         # Step 3: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
@@ -263,6 +247,8 @@ class CausalInferencePipeline(torch.nn.Module):
 
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+
+            fw = build_fast_weights_dict(fast_params) if fast_params else None
 
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
@@ -280,7 +266,8 @@ class CausalInferencePipeline(torch.nn.Module):
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=current_start_frame * self.frame_seq_length,
+                        fast_weights=fw,
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -297,17 +284,27 @@ class CausalInferencePipeline(torch.nn.Module):
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=current_start_frame * self.frame_seq_length,
+                        fast_weights=fw,
                     )
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
 
-            # Step 3.2b (TTT): adapt prime params via diffusion loss
-            # if self.ttt_enabled:
-            #     self._ttt_step(denoised_pred, conditional_dict, current_start_frame)
+            # Step 3.2b: TTT inner-loop update (mirrors training pipeline)
+            if fast_params is not None:
+                inner_loss = self._compute_inner_loss(
+                    denoised_pred.detach(), fw, conditional_dict,
+                    current_start_frame,
+                )
+                fast_params = functional_inner_step(
+                    fast_params, inner_loss,
+                    self.ttt_inner_lr, self.ttt_inner_clip,
+                    create_graph=False,
+                )
 
-            # Step 3.3: rerun with timestep zero to update KV cache using clean context
+            # Step 3.3: rerun with timestep zero to update KV cache
+            new_fw = build_fast_weights_dict(fast_params) if fast_params else None
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             self.generator(
                 noisy_image_or_video=denoised_pred,
@@ -316,6 +313,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
+                fast_weights=new_fw,
             )
 
             if profile:

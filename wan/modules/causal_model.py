@@ -345,7 +345,9 @@ class CausalWanAttentionBlock(nn.Module):
         crossattn_cache=None,
         current_start=0,
         cache_start=None,
-        update_cache=True
+        update_cache=True,
+        prime_ffn_override=None,
+        detach_prime_input=False,
     ):
         r"""
         Args:
@@ -355,6 +357,12 @@ class CausalWanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             update_cache (bool): When False, read from KV cache without writing.
+            prime_ffn_override (dict | None): When provided, a dict mapping
+                param name -> tensor used via ``functional_call`` on
+                ``self.prime_ffn`` instead of the module's own weights.
+            detach_prime_input (bool): When True, detach x before PrimeFFN
+                and wrap in enable_grad so the inner-loop graph only flows
+                through fast weights (not FSDP-managed slow params).
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
@@ -383,9 +391,22 @@ class CausalWanAttentionBlock(nn.Module):
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
 
         # TTT prime adapter (parallel to main FFN, on residual stream)
+        self._prime_out = None
         if self.prime_ffn is not None:
-            e_base = e[3]  # reuse the FFN shift embedding as base signal
-            x = x + self.prime_ffn(x, e_base)
+            e_base = e[3]
+            if prime_ffn_override is not None:
+                from torch.func import functional_call
+                if detach_prime_input:
+                    with torch.enable_grad():
+                        prime_out = functional_call(
+                            self.prime_ffn, prime_ffn_override,
+                            (x.detach(), e_base.detach()))
+                        self._prime_out = prime_out
+                        x = x + prime_out
+                else:
+                    x = x + functional_call(self.prime_ffn, prime_ffn_override, (x, e_base))
+            else:
+                x = x + self.prime_ffn(x, e_base)
 
         return x
 
@@ -777,7 +798,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         crossattn_cache: dict = None,
         current_start: int = 0,
         cache_start: int = 0,
-        update_cache: bool = True
+        update_cache: bool = True,
+        fast_weights: dict = None,
+        detach_prime_input: bool = False,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -867,13 +890,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             return custom_forward
 
         for block_index, block in enumerate(self.blocks):
+            override = fast_weights.get(block_index) if fast_weights else None
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 kwargs.update(
                     {
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
                         "cache_start": cache_start,
-                        "update_cache": update_cache
+                        "update_cache": update_cache,
+                        "prime_ffn_override": override,
+                        "detach_prime_input": detach_prime_input,
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -888,14 +914,20 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
                         "cache_start": cache_start,
-                        "update_cache": update_cache
+                        "update_cache": update_cache,
+                        "prime_ffn_override": override,
+                        "detach_prime_input": detach_prime_input,
                     }
                 )
                 x = block(x, **kwargs)
 
-        # head
+        # head + unpatchify
+        if detach_prime_input:
+            with torch.enable_grad():
+                x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
+                x = self.unpatchify(x, grid_sizes)
+                return torch.stack(x)
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
-        # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return torch.stack(x)
 
@@ -1066,6 +1098,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             return self._forward_inference(*args, **kwargs)
         else:
             kwargs.pop('update_cache', None)
+            kwargs.pop('fast_weights', None)
             return self._forward_train(*args, **kwargs)
 
     def unpatchify(self, x, grid_sizes):
@@ -1147,6 +1180,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             print(f"[TTT] Prime params: {num_prime_params:,} "
                   f"({100 * num_prime_params / num_total_params:.2f}% of "
                   f"{num_total_params:,} total)")
+
+    def get_prime_modules(self):
+        """Return a list of PrimeFFN modules (for FSDP ignored_modules)."""
+        return [blk.prime_ffn for blk in self.blocks if blk.prime_ffn is not None]
 
     def get_prime_parameters(self):
         """Return an iterator over all PrimeFFN parameters (for TTT inner loop)."""

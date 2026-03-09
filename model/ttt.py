@@ -1,18 +1,13 @@
 """TTT-E2E model for Self-Forcing video generation.
 
-Extends DMD with test-time training: the generator adapts its PrimeFFN
-adapters per-block during autoregressive rollout using a diffusion
-(flow-prediction) self-supervised loss.  The outer DMD loss trains all
-parameters end-to-end.
-
-Use ``min_ttt_blocks`` / ``max_ttt_blocks`` to control how many warmup
-blocks (with TTT inner-loop updates) are prepended before the 21-frame
-gradient window each iteration.
+Meta-learning variant: PrimeFFN "fast weights" are cloned per video,
+updated functionally per block (inner loop with ``create_graph=True``),
+and the outer DMD loss back-props through the entire inner-loop chain
+to train both slow weights and the initial fast weights end-to-end.
 """
 
 from typing import Tuple
 import torch
-import torch.distributed as dist
 
 from model.dmd import DMD
 from pipeline import SelfForcingTrainingPipeline
@@ -24,15 +19,7 @@ class TTT_E2E(DMD):
         super().__init__(args, device)
         self.ttt_inner_lr = getattr(args, "ttt_inner_lr", 1e-3)
         self.ttt_inner_clip = getattr(args, "ttt_inner_clip", 1.0)
-        self.ttt_inner_b1 = getattr(args, "ttt_inner_b1", 0.9)
-        self.ttt_inner_b2 = getattr(args, "ttt_inner_b2", 0.999)
-
-        min_ttt_blocks = getattr(args, "min_ttt_blocks", 0)
-        max_ttt_blocks = getattr(args, "max_ttt_blocks", 0)
-        if max_ttt_blocks > 0:
-            base_frames = 21
-            self.min_training_frames = base_frames + min_ttt_blocks * self.num_frame_per_block
-            self.num_training_frames = base_frames + max_ttt_blocks * self.num_frame_per_block
+        self.ttt_first_order = getattr(args, "ttt_first_order", False)
 
     def _initialize_inference_pipeline(self):
         self.inference_pipeline = SelfForcingTrainingPipeline(
@@ -48,8 +35,7 @@ class TTT_E2E(DMD):
             ttt_enabled=True,
             ttt_inner_lr=self.ttt_inner_lr,
             ttt_inner_clip=self.ttt_inner_clip,
-            ttt_inner_b1=self.ttt_inner_b1,
-            ttt_inner_b2=self.ttt_inner_b2,
+            ttt_first_order=self.ttt_first_order,
         )
 
     def generator_loss(
@@ -60,7 +46,14 @@ class TTT_E2E(DMD):
         clean_latent: torch.Tensor = None,
         initial_latent: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
-        """Generate video with TTT inner loop, then compute DMD loss."""
+        """Generate video with meta-learning inner loop, then compute DMD loss.
+
+        The pipeline's ``inference_with_trajectory`` now produces a
+        trajectory whose computational graph threads through the
+        functional fast-weight updates.  ``super().generator_loss``
+        computes the DMD loss on this trajectory; gradients flow back
+        through the inner loop to both slow and initial-fast parameters.
+        """
         dmd_loss, dmd_log_dict = super().generator_loss(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,

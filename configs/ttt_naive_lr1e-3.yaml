@@ -1,21 +1,16 @@
-# TTT-E2E: 0-to-1 TTT warmup variant.
-# min_ttt_blocks=0 means some iterations have no TTT warmup at all
-# (equivalent to baseline self-forcing for that iteration).
-# KV cache is shared between warmup and gradient-window blocks.
+# TTT-naive: inference-only TTT using a standard Self-Forcing checkpoint.
+# PrimeFFN adapters are added at inference and adapted per-block via
+# functional SGD (same inner loop as TTT-E2E training).
 
 # ---- TTT config ----
 ttt_enabled: true
-ttt_mode: e2e
+ttt_mode: naive
 ttt_suffix_len: 10
 ttt_prime_ffn_dim: 1536
 ttt_inner_lr: 1.0e-03
 ttt_inner_clip: 1.0
-ttt_inner_b1: 0.9
-ttt_inner_b2: 0.999
-min_ttt_blocks: 0
-max_ttt_blocks: 1
 
-# ---- Base Self-Forcing config ----
+# ---- Base Self-Forcing config (copy from self_forcing_dmd.yaml) ----
 generator_ckpt: checkpoints/ode_init.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size

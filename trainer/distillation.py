@@ -117,12 +117,26 @@ class Trainer:
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
 
+        # Collect PrimeFFN modules so FSDP keeps them replicated (meta-learning
+        # needs per-rank fast-weight clones that are not sharded).
+        self.ttt_mode = getattr(config, "ttt_mode", None)
+        prime_ignored_modules = None
+        if getattr(config, "ttt_enabled", False):
+            prime_ignored_modules = self.model.generator.model.get_prime_modules()
+
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy
+            wrap_strategy=config.generator_fsdp_wrap_strategy,
+            ignored_modules=prime_ignored_modules,
         )
+
+        # FSDP doesn't move/cast ignored modules -- do it explicitly
+        # to match device and the mixed-precision compute dtype.
+        if prime_ignored_modules:
+            for m in prime_ignored_modules:
+                m.to(device=self.device, dtype=self.dtype)
 
         self.model.real_score = fsdp_wrap(
             self.model.real_score,
@@ -300,6 +314,17 @@ class Trainer:
         for _, path in checkpoints[keep:]:
             shutil.rmtree(path)
 
+    def _sync_prime_grads(self):
+        """All-reduce PrimeFFN gradients which are not managed by FSDP."""
+        model = self.model.generator.module if hasattr(self.model.generator, "module") else self.model.generator
+        inner_model = model.model if hasattr(model, "model") else model
+        if hasattr(inner_model, "_orig_mod"):
+            inner_model = inner_model._orig_mod
+        for p in inner_model.get_prime_parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                p.grad.div_(self.world_size)
+
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
@@ -345,6 +370,10 @@ class Trainer:
             )
 
             generator_loss.backward()
+
+            if self.ttt_mode == "e2e":
+                self._sync_prime_grads()
+
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm_generator)
 

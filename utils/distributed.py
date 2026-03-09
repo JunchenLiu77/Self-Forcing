@@ -26,7 +26,7 @@ def fsdp_state_dict(model):
     return _clean_fsdp_keys(checkpoint)
 
 
-def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False):
+def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False, ignored_modules=None):
     if mixed_precision:
         mixed_precision_policy = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -59,8 +59,7 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         "no_shard": ShardingStrategy.NO_SHARD,
     }[sharding_strategy]
 
-    module = FSDP(
-        module,
+    fsdp_kwargs = dict(
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=sharding_strategy,
         mixed_precision=mixed_precision_policy,
@@ -68,8 +67,12 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         limit_all_gathers=True,
         use_orig_params=True,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
-        sync_module_states=False  # Load ckpt on rank 0 and sync to other ranks
+        sync_module_states=False,
     )
+    if ignored_modules is not None:
+        fsdp_kwargs["ignored_modules"] = ignored_modules
+
+    module = FSDP(module, **fsdp_kwargs)
     return module
 
 
