@@ -8,6 +8,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
 
 from .attention import flash_attention
+from utils.wan_cache import build_crossattn_cache_entry, ensure_bool_tensor
 
 __all__ = ['WanModel']
 
@@ -158,7 +159,14 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, crossattn_cache=None):
+    def forward(
+        self,
+        x,
+        context,
+        context_lens,
+        crossattn_cache=None,
+        return_cache=False,
+    ):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -171,13 +179,18 @@ class WanT2VCrossAttention(WanSelfAttention):
         # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
+        updated_cache = crossattn_cache
         if crossattn_cache is not None:
-            if not crossattn_cache["is_init"]:
-                crossattn_cache["is_init"] = True
+            is_init = bool(
+                ensure_bool_tensor(
+                    crossattn_cache["is_init"],
+                    device=crossattn_cache["k"].device,
+                ).item()
+            )
+            if not is_init:
                 k = self.norm_k(self.k(context)).view(b, -1, n, d)
                 v = self.v(context).view(b, -1, n, d)
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
+                updated_cache = build_crossattn_cache_entry(k, v, True)
             else:
                 k = crossattn_cache["k"]
                 v = crossattn_cache["v"]
@@ -191,12 +204,14 @@ class WanT2VCrossAttention(WanSelfAttention):
         # output
         x = x.flatten(2)
         x = self.o(x)
+        if return_cache:
+            return x, updated_cache
         return x
 
 
 class WanGanCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, crossattn_cache=None):
+    def forward(self, x, context, crossattn_cache=None, return_cache=False):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -218,6 +233,8 @@ class WanGanCrossAttention(WanSelfAttention):
         # output
         x = x.flatten(2)
         x = self.o(x)
+        if return_cache:
+            return x, crossattn_cache
         return x
 
 
@@ -237,7 +254,14 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.norm_k_img = WanRMSNorm(
             dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, context_lens):
+    def forward(
+        self,
+        x,
+        context,
+        context_lens,
+        crossattn_cache=None,
+        return_cache=False,
+    ):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -263,6 +287,8 @@ class WanI2VCrossAttention(WanSelfAttention):
         img_x = img_x.flatten(2)
         x = x + img_x
         x = self.o(x)
+        if return_cache:
+            return x, crossattn_cache
         return x
 
 

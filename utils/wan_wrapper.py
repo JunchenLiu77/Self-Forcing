@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
+from utils.wan_cache import overwrite_cache_state_
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
@@ -229,6 +230,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         update_cache: Optional[bool] = True,
         fast_weights: Optional[dict] = None,
         detach_prime_input: bool = False,
+        return_cache: bool = False,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -241,7 +243,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         logits = None
         # X0 prediction
         if kv_cache is not None:
-            flow_pred = self.model(
+            flow_pred, new_kv_cache, new_crossattn_cache = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
                 seq_len=self.seq_len,
@@ -252,7 +254,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 update_cache=update_cache,
                 fast_weights=fast_weights,
                 detach_prime_input=detach_prime_input,
-            ).permute(0, 2, 1, 3, 4)
+            )
+            flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
                 # teacher forcing
@@ -292,6 +295,15 @@ class WanDiffusionWrapper(torch.nn.Module):
         if logits is not None:
             return flow_pred, pred_x0, logits
 
+        if kv_cache is not None and return_cache:
+            return flow_pred, pred_x0, new_kv_cache, new_crossattn_cache
+        if kv_cache is not None:
+            overwrite_cache_state_(
+                kv_cache,
+                crossattn_cache,
+                new_kv_cache,
+                new_crossattn_cache,
+            )
         return flow_pred, pred_x0
 
     def get_scheduler(self) -> SchedulerInterface:

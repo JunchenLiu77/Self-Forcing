@@ -5,11 +5,12 @@
 # ---- TTT config ----
 ttt_enabled: true
 ttt_mode: e2e
-ttt_suffix_len: 5
+ttt_suffix_len: 1
 ttt_prime_ffn_dim: 768
 ttt_inner_lr: 1.0
 ttt_inner_clip: 1.0
 ttt_first_order: true
+ttt_rollout_checkpoint_every: 2
 
 # ---- Base Self-Forcing config ----
 generator_ckpt: checkpoints/ode_init.pt

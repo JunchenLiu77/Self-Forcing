@@ -16,6 +16,11 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+from utils.wan_cache import (
+    build_crossattn_cache_entry,
+    build_kv_cache_entry,
+    ensure_bool_tensor,
+)
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -53,6 +58,63 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
         # append to collection
         output.append(x_i)
     return torch.stack(output).type_as(x)
+
+
+def _pack_kv_cache_entry(kv_cache):
+    if kv_cache is None:
+        return None, None, None, None
+    return (
+        kv_cache["k"],
+        kv_cache["v"],
+        kv_cache["global_end_index"],
+        kv_cache["local_end_index"],
+    )
+
+
+def _pack_crossattn_cache_entry(crossattn_cache):
+    if crossattn_cache is None:
+        return None, None, None
+    return (
+        crossattn_cache["k"],
+        crossattn_cache["v"],
+        ensure_bool_tensor(crossattn_cache["is_init"], device=crossattn_cache["k"].device),
+    )
+
+
+def _run_checkpointed_causal_block(module, block_kwargs):
+    def custom_forward(
+        x,
+        kv_k,
+        kv_v,
+        kv_global_end,
+        kv_local_end,
+        cross_k,
+        cross_v,
+        cross_is_init,
+    ):
+        kv_cache = build_kv_cache_entry(kv_k, kv_v, kv_global_end, kv_local_end)
+        crossattn_cache = build_crossattn_cache_entry(cross_k, cross_v, cross_is_init)
+        x, kv_cache, crossattn_cache = module(
+            x,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            return_cache=True,
+            **block_kwargs,
+        )
+        kv_k, kv_v, kv_global_end, kv_local_end = _pack_kv_cache_entry(kv_cache)
+        cross_k, cross_v, cross_is_init = _pack_crossattn_cache_entry(crossattn_cache)
+        return (
+            x,
+            kv_k,
+            kv_v,
+            kv_global_end,
+            kv_local_end,
+            cross_k,
+            cross_v,
+            cross_is_init,
+        )
+
+    return custom_forward
 
 
 class PrimeFFN(nn.Module):
@@ -126,7 +188,8 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache=None,
         current_start=0,
         cache_start=None,
-        update_cache=True
+        update_cache=True,
+        return_cache=False,
     ):
         r"""
         Args:
@@ -150,6 +213,7 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        updated_cache = kv_cache
         if kv_cache is None:
             # if it is teacher forcing training?
             is_tf = (s == seq_lens[0].item() * 2)
@@ -255,35 +319,56 @@ class CausalWanSelfAttention(nn.Module):
                 full_v = torch.cat([kv_cache["v"][:, ctx_start:ctx_local_end], v], dim=1)
                 x = attention(roped_query, full_k, full_v)
             else:
+                mutate_cache_in_place = not torch.is_grad_enabled()
+                # Match the e2e rollout pattern: keep cache state pure across the
+                # checkpoint boundary, but allow no-grad refreshes to mutate the
+                # checkpoint-local cache copy in place to avoid full-buffer clones.
+                if mutate_cache_in_place:
+                    next_k = kv_cache["k"]
+                    next_v = kv_cache["v"]
+                else:
+                    next_k = kv_cache["k"].clone()
+                    next_v = kv_cache["v"].clone()
                 if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                         num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                     num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
                     num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                    kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                    next_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                    kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                    next_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     local_end_index = kv_cache["local_end_index"].item() + current_end - \
                         kv_cache["global_end_index"].item() - num_evicted_tokens
                     local_start_index = local_end_index - num_new_tokens
-                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                    kv_cache["v"][:, local_start_index:local_end_index] = v
+                    next_k[:, local_start_index:local_end_index] = roped_key
+                    next_v[:, local_start_index:local_end_index] = v
                 else:
                     local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                     local_start_index = local_end_index - num_new_tokens
-                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                    kv_cache["v"][:, local_start_index:local_end_index] = v
+                    next_k[:, local_start_index:local_end_index] = roped_key
+                    next_v[:, local_start_index:local_end_index] = v
                 x = attention(
                     roped_query,
-                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                    next_k[:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                    next_v[:, max(0, local_end_index - self.max_attention_size):local_end_index]
                 )
-                kv_cache["global_end_index"].fill_(current_end)
-                kv_cache["local_end_index"].fill_(local_end_index)
+                if mutate_cache_in_place:
+                    kv_cache["global_end_index"].fill_(current_end)
+                    kv_cache["local_end_index"].fill_(local_end_index)
+                    updated_cache = kv_cache
+                else:
+                    updated_cache = build_kv_cache_entry(
+                        next_k,
+                        next_v,
+                        kv_cache["global_end_index"].new_tensor([current_end]),
+                        kv_cache["local_end_index"].new_tensor([local_end_index]),
+                    )
 
         # output
         x = x.flatten(2)
         x = self.o(x)
+        if return_cache:
+            return x, updated_cache
         return x
 
 
@@ -348,6 +433,7 @@ class CausalWanAttentionBlock(nn.Module):
         update_cache=True,
         prime_ffn_override=None,
         detach_prime_input=False,
+        return_cache=False,
     ):
         r"""
         Args:
@@ -368,27 +454,37 @@ class CausalWanAttentionBlock(nn.Module):
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
         # self-attention
-        y = self.self_attn(
+        y, kv_cache = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
             freqs, block_mask, kv_cache, current_start, cache_start,
-            update_cache=update_cache)
+            update_cache=update_cache,
+            return_cache=True,
+        )
 
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
-            x = x + self.cross_attn(self.norm3(x), context,
-                                    context_lens, crossattn_cache=crossattn_cache)
+            y, crossattn_cache = self.cross_attn(
+                self.norm3(x),
+                context,
+                context_lens,
+                crossattn_cache=crossattn_cache,
+                return_cache=True,
+            )
+            x = x + y
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
             )
             x = x + (y.unflatten(dim=1, sizes=(num_frames,
                      frame_seqlen)) * e[5]).flatten(1, 2)
-            return x
+            return x, crossattn_cache
 
-        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
+        x, crossattn_cache = cross_attn_ffn(
+            x, context, context_lens, e, crossattn_cache
+        )
 
         # TTT prime adapter (parallel to main FFN, on residual stream)
         self._prime_out = None
@@ -408,6 +504,8 @@ class CausalWanAttentionBlock(nn.Module):
             else:
                 x = x + self.prime_ffn(x, e_base)
 
+        if return_cache:
+            return x, kv_cache, crossattn_cache
         return x
 
 
@@ -884,52 +982,81 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             block_mask=self.block_mask
         )
 
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
-            return custom_forward
-
         for block_index, block in enumerate(self.blocks):
             override = fast_weights.get(block_index) if fast_weights else None
+            block_kwargs = dict(kwargs)
+            block_kwargs.update(
+                {
+                    "current_start": current_start,
+                    "cache_start": cache_start,
+                    "update_cache": update_cache,
+                    "prime_ffn_override": override,
+                    "detach_prime_input": detach_prime_input,
+                }
+            )
+            kv_k, kv_v, kv_global_end, kv_local_end = _pack_kv_cache_entry(
+                kv_cache[block_index]
+            )
+            cross_k, cross_v, cross_is_init = _pack_crossattn_cache_entry(
+                crossattn_cache[block_index]
+            )
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                kwargs.update(
-                    {
-                        "kv_cache": kv_cache[block_index],
-                        "current_start": current_start,
-                        "cache_start": cache_start,
-                        "update_cache": update_cache,
-                        "prime_ffn_override": override,
-                        "detach_prime_input": detach_prime_input,
-                    }
-                )
-                x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
+                (
+                    x,
+                    kv_k,
+                    kv_v,
+                    kv_global_end,
+                    kv_local_end,
+                    cross_k,
+                    cross_v,
+                    cross_is_init,
+                ) = torch.utils.checkpoint.checkpoint(
+                    _run_checkpointed_causal_block(block, block_kwargs),
+                    x,
+                    kv_k,
+                    kv_v,
+                    kv_global_end,
+                    kv_local_end,
+                    cross_k,
+                    cross_v,
+                    cross_is_init,
                     use_reentrant=False,
                 )
             else:
-                kwargs.update(
-                    {
-                        "kv_cache": kv_cache[block_index],
-                        "crossattn_cache": crossattn_cache[block_index],
-                        "current_start": current_start,
-                        "cache_start": cache_start,
-                        "update_cache": update_cache,
-                        "prime_ffn_override": override,
-                        "detach_prime_input": detach_prime_input,
-                    }
+                x, kv_cache_entry, crossattn_cache_entry = block(
+                    x,
+                    kv_cache=kv_cache[block_index],
+                    crossattn_cache=crossattn_cache[block_index],
+                    return_cache=True,
+                    **block_kwargs,
                 )
-                x = block(x, **kwargs)
+                kv_k, kv_v, kv_global_end, kv_local_end = _pack_kv_cache_entry(
+                    kv_cache_entry
+                )
+                cross_k, cross_v, cross_is_init = _pack_crossattn_cache_entry(
+                    crossattn_cache_entry
+                )
+            kv_cache[block_index] = build_kv_cache_entry(
+                kv_k,
+                kv_v,
+                kv_global_end,
+                kv_local_end,
+            )
+            crossattn_cache[block_index] = build_crossattn_cache_entry(
+                cross_k,
+                cross_v,
+                cross_is_init,
+            )
 
         # head + unpatchify
         if detach_prime_input:
             with torch.enable_grad():
                 x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
                 x = self.unpatchify(x, grid_sizes)
-                return torch.stack(x)
+                return torch.stack(x), kv_cache, crossattn_cache
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = self.unpatchify(x, grid_sizes)
-        return torch.stack(x)
+        return torch.stack(x), kv_cache, crossattn_cache
 
     def _forward_train(
         self,

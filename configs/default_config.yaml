@@ -8,6 +8,7 @@ i2v: false
 num_training_frames: 21
 gc_interval: 100
 context_noise: 0
+ttt_rollout_checkpoint_every: 0
 causal: true
 
 ckpt_step: 0

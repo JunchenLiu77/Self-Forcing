@@ -5,6 +5,7 @@ import torch
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_cache import build_crossattn_cache_entry, build_kv_cache_entry
 
 
 class CausalDiffusionInferencePipeline(torch.nn.Module):
@@ -110,8 +111,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         else:
             # reset cross attn cache
             for block_index in range(self.num_transformer_blocks):
-                self.crossattn_cache_pos[block_index]["is_init"] = False
-                self.crossattn_cache_neg[block_index]["is_init"] = False
+                self.crossattn_cache_pos[block_index]["is_init"] = torch.tensor(
+                    [False], dtype=torch.bool, device=noise.device
+                )
+                self.crossattn_cache_neg[block_index]["is_init"] = torch.tensor(
+                    [False], dtype=torch.bool, device=noise.device
+                )
             # reset kv cache
             for block_index in range(len(self.kv_cache_pos)):
                 self.kv_cache_pos[block_index]["global_end_index"] = torch.tensor(
@@ -122,6 +127,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_neg[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
+        kv_cache_pos = self.kv_cache_pos
+        kv_cache_neg = self.kv_cache_neg
+        crossattn_cache_pos = self.crossattn_cache_pos
+        crossattn_cache_neg = self.crossattn_cache_neg
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
@@ -133,23 +142,25 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 assert (num_input_frames - 1) % self.num_frame_per_block == 0
                 num_input_blocks = (num_input_frames - 1) // self.num_frame_per_block
                 output[:, :1] = initial_latent[:, :1]
-                self.generator(
+                _, _, kv_cache_pos, crossattn_cache_pos = self.generator(
                     noisy_image_or_video=initial_latent[:, :1],
                     conditional_dict=conditional_dict,
                     timestep=timestep * 0,
-                    kv_cache=self.kv_cache_pos,
-                    crossattn_cache=self.crossattn_cache_pos,
+                    kv_cache=kv_cache_pos,
+                    crossattn_cache=crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    return_cache=True,
                 )
-                self.generator(
+                _, _, kv_cache_neg, crossattn_cache_neg = self.generator(
                     noisy_image_or_video=initial_latent[:, :1],
                     conditional_dict=unconditional_dict,
                     timestep=timestep * 0,
-                    kv_cache=self.kv_cache_neg,
-                    crossattn_cache=self.crossattn_cache_neg,
+                    kv_cache=kv_cache_neg,
+                    crossattn_cache=crossattn_cache_neg,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    return_cache=True,
                 )
                 current_start_frame += 1
                 cache_start_frame += 1
@@ -162,23 +173,25 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 current_ref_latents = \
                     initial_latent[:, cache_start_frame:cache_start_frame + self.num_frame_per_block]
                 output[:, cache_start_frame:cache_start_frame + self.num_frame_per_block] = current_ref_latents
-                self.generator(
+                _, _, kv_cache_pos, crossattn_cache_pos = self.generator(
                     noisy_image_or_video=current_ref_latents,
                     conditional_dict=conditional_dict,
                     timestep=timestep * 0,
-                    kv_cache=self.kv_cache_pos,
-                    crossattn_cache=self.crossattn_cache_pos,
+                    kv_cache=kv_cache_pos,
+                    crossattn_cache=crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    return_cache=True,
                 )
-                self.generator(
+                _, _, kv_cache_neg, crossattn_cache_neg = self.generator(
                     noisy_image_or_video=current_ref_latents,
                     conditional_dict=unconditional_dict,
                     timestep=timestep * 0,
-                    kv_cache=self.kv_cache_neg,
-                    crossattn_cache=self.crossattn_cache_neg,
+                    kv_cache=kv_cache_neg,
+                    crossattn_cache=crossattn_cache_neg,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    return_cache=True,
                 )
                 current_start_frame += self.num_frame_per_block
                 cache_start_frame += self.num_frame_per_block
@@ -200,23 +213,25 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     [batch_size, current_num_frames], device=noise.device, dtype=torch.float32
                 )
 
-                flow_pred_cond, _ = self.generator(
+                flow_pred_cond, _, kv_cache_pos, crossattn_cache_pos = self.generator(
                     noisy_image_or_video=latent_model_input,
                     conditional_dict=conditional_dict,
                     timestep=timestep,
-                    kv_cache=self.kv_cache_pos,
-                    crossattn_cache=self.crossattn_cache_pos,
+                    kv_cache=kv_cache_pos,
+                    crossattn_cache=crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    return_cache=True,
                 )
-                flow_pred_uncond, _ = self.generator(
+                flow_pred_uncond, _, kv_cache_neg, crossattn_cache_neg = self.generator(
                     noisy_image_or_video=latent_model_input,
                     conditional_dict=unconditional_dict,
                     timestep=timestep,
-                    kv_cache=self.kv_cache_neg,
-                    crossattn_cache=self.crossattn_cache_neg,
+                    kv_cache=kv_cache_neg,
+                    crossattn_cache=crossattn_cache_neg,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    return_cache=True,
                 )
 
                 flow_pred = flow_pred_uncond + self.args.guidance_scale * (
@@ -228,35 +243,42 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     latents,
                     return_dict=False)[0]
                 latents = temp_x0
-                print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
-                print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
+                print(f"kv_cache['local_end_index']: {kv_cache_pos[0]['local_end_index']}")
+                print(f"kv_cache['global_end_index']: {kv_cache_pos[0]['global_end_index']}")
 
             # Step 3.2: record the model's output
             output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
-            self.generator(
+            _, _, kv_cache_pos, crossattn_cache_pos = self.generator(
                 noisy_image_or_video=latents,
                 conditional_dict=conditional_dict,
                 timestep=timestep * 0,
-                kv_cache=self.kv_cache_pos,
-                crossattn_cache=self.crossattn_cache_pos,
+                kv_cache=kv_cache_pos,
+                crossattn_cache=crossattn_cache_pos,
                 current_start=current_start_frame * self.frame_seq_length,
-                cache_start=cache_start_frame * self.frame_seq_length
+                cache_start=cache_start_frame * self.frame_seq_length,
+                return_cache=True,
             )
-            self.generator(
+            _, _, kv_cache_neg, crossattn_cache_neg = self.generator(
                 noisy_image_or_video=latents,
                 conditional_dict=unconditional_dict,
                 timestep=timestep * 0,
-                kv_cache=self.kv_cache_neg,
-                crossattn_cache=self.crossattn_cache_neg,
+                kv_cache=kv_cache_neg,
+                crossattn_cache=crossattn_cache_neg,
                 current_start=current_start_frame * self.frame_seq_length,
-                cache_start=cache_start_frame * self.frame_seq_length
+                cache_start=cache_start_frame * self.frame_seq_length,
+                return_cache=True,
             )
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
             cache_start_frame += current_num_frames
+
+        self.kv_cache_pos = kv_cache_pos
+        self.kv_cache_neg = kv_cache_neg
+        self.crossattn_cache_pos = crossattn_cache_pos
+        self.crossattn_cache_neg = crossattn_cache_neg
 
         # Step 4: Decode the output
         video = self.vae.decode_to_pixel(output)
@@ -281,18 +303,22 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             kv_cache_size = 32760
 
         for _ in range(self.num_transformer_blocks):
-            kv_cache_pos.append({
-                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
-            })
-            kv_cache_neg.append({
-                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
-            })
+            kv_cache_pos.append(
+                build_kv_cache_entry(
+                    torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                    torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                    torch.tensor([0], dtype=torch.long, device=device),
+                    torch.tensor([0], dtype=torch.long, device=device),
+                )
+            )
+            kv_cache_neg.append(
+                build_kv_cache_entry(
+                    torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                    torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                    torch.tensor([0], dtype=torch.long, device=device),
+                    torch.tensor([0], dtype=torch.long, device=device),
+                )
+            )
 
         self.kv_cache_pos = kv_cache_pos  # always store the clean cache
         self.kv_cache_neg = kv_cache_neg  # always store the clean cache
@@ -304,16 +330,20 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         crossattn_cache_pos = []
         crossattn_cache_neg = []
         for _ in range(self.num_transformer_blocks):
-            crossattn_cache_pos.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "is_init": False
-            })
-            crossattn_cache_neg.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "is_init": False
-            })
+            crossattn_cache_pos.append(
+                build_crossattn_cache_entry(
+                    torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                    torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                    torch.tensor([False], dtype=torch.bool, device=device),
+                )
+            )
+            crossattn_cache_neg.append(
+                build_crossattn_cache_entry(
+                    torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                    torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                    torch.tensor([False], dtype=torch.bool, device=device),
+                )
+            )
 
         self.crossattn_cache_pos = crossattn_cache_pos  # always store the clean cache
         self.crossattn_cache_neg = crossattn_cache_neg  # always store the clean cache

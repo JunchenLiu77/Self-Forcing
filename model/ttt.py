@@ -20,6 +20,9 @@ class TTT_E2E(DMD):
         self.ttt_inner_lr = getattr(args, "ttt_inner_lr", 1e-3)
         self.ttt_inner_clip = getattr(args, "ttt_inner_clip", 1.0)
         self.ttt_first_order = getattr(args, "ttt_first_order", False)
+        self.ttt_rollout_checkpoint_every = getattr(
+            args, "ttt_rollout_checkpoint_every", 0
+        )
 
     def _initialize_inference_pipeline(self):
         self.inference_pipeline = SelfForcingTrainingPipeline(
@@ -36,6 +39,10 @@ class TTT_E2E(DMD):
             ttt_inner_lr=self.ttt_inner_lr,
             ttt_inner_clip=self.ttt_inner_clip,
             ttt_first_order=self.ttt_first_order,
+            ttt_rollout_checkpoint_every=self.ttt_rollout_checkpoint_every,
+            disable_model_checkpointing_during_rollout_ckpt=getattr(
+                self.args, "disable_model_checkpointing_during_rollout_ckpt", False
+            ),
         )
 
     def generator_loss(

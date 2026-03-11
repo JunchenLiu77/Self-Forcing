@@ -219,5 +219,11 @@ class SelfForcingModel(BaseModel):
             same_step_across_blocks=self.args.same_step_across_blocks,
             last_step_only=self.args.last_step_only,
             num_max_frames=self.num_training_frames,
-            context_noise=self.args.context_noise
+            context_noise=self.args.context_noise,
+            ttt_rollout_checkpoint_every=getattr(
+                self.args, "ttt_rollout_checkpoint_every", 0
+            ),
+            disable_model_checkpointing_during_rollout_ckpt=getattr(
+                self.args, "disable_model_checkpointing_during_rollout_ckpt", False
+            ),
         )
